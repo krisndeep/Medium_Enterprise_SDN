@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Medium Enterprise SDN
 
 A Ryu-based OpenFlow 1.3 controller and Mininet topology for a medium-scale software development enterprise network. The project demonstrates centralized network policy enforcement, QoS differentiation, VLAN segmentation, controller failover, and dynamic attacker quarantine — all driven entirely through SDN.
@@ -440,3 +441,14 @@ Medium_Enterprise_SDN/
 | `PRIMARY_CONTROLLER_PORT` | `6653` | Primary controller OpenFlow port |
 | `STANDBY_CONTROLLER_PORT` | `6654` | Standby controller OpenFlow port |
 | `LINK_MAX_RATE` | `100,000,000` | Parent link rate (100 Mbps) |
+=======
+# Medium_Enterprise_SDN
+A Ryu based controller implemenation for a medium scale software development enterprise network.
+
+To run primary controller
+```RYU_ROLE=primary ryu-manager --ofp-tcp-listen-port 6653 contr2.py```
+To run standby controller
+```RYU_ROLE=standby RYU_PEER_IP=127.0.0.1 RYU_PEER_PORT=6653 ryu-manager --ofp-tcp-listen-port 6654 contr.py```
+To run mininet topo
+```sudo python3 topo2.py```
+>>>>>>> 9289a56853ac878f185f475c3a284646a3063012
