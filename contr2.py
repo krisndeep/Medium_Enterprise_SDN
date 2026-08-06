@@ -205,6 +205,7 @@ class EnterpriseController(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
+        self.datapaths[datapath.id] = datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -268,15 +269,24 @@ class EnterpriseController(app_manager.RyuApp):
     # ----------------------------------------------------------------
     # Helper: extract VLAN ID (Management sub-classification)
     # ----------------------------------------------------------------
-    def get_management_vlan(self, msg):
-        
-            ofproto = msg.datapath.ofproto
-            vlan_vid = msg.match.get('vlan_vid')
+    def get_management_vlan(self, dpid, in_port):
+        if dpid !=6:
+            return None
+        if in_port in (2, 3):
+            return 50
+        if in_port in (4, 5):
+            return 60
+        return None
+    
+        ''''
+        ofproto = msg.datapath.ofproto
+        vlan_vid = msg.match.get('vlan_vid')
 
-            if vlan_vid is None or not (vlan_vid & ofproto.OFPVID_PRESENT):
-                return None
+        if vlan_vid is None or not (vlan_vid & ofproto.OFPVID_PRESENT):
+            return None
 
-            return vlan_vid & ~ofproto.OFPVID_PRESENT
+        return vlan_vid & ~ofproto.OFPVID_PRESENT
+        '''
     # ----------------------------------------------------------------
     # Helper: inter-department policy check
     # ----------------------------------------------------------------
@@ -403,7 +413,12 @@ class EnterpriseController(app_manager.RyuApp):
         if src_department == 'MANAGEMENT':
             #self.logger.info('FULL MATCH FIELDS: %s', dict(msg.match.items()))
             #self.logger.info('RAW FRAME HEX: %s', msg.data.hex())
-            vlan_id = self.get_management_vlan(msg)
+            vlan_header = pkt.get_protocol(vlan_pkt.vlan)
+            if vlan_header is not None:
+                vlan_id = vlan_header.vid
+            else:
+                vlan_id = None
+
             self.logger.info('Management VLAN detected: dpid=%s in_port=%s vlan=%s',
                               dpid, in_port, vlan_id)
 
@@ -468,7 +483,9 @@ class EnterpriseController(app_manager.RyuApp):
                 # 2. Ingressing from uplink (port 1), egressing to a host port -> Pop VLAN safely
                 elif in_port == 1 and out_port != ofproto.OFPP_FLOOD and out_port != 1:
                     # Explicitly validate the presence of the 802.1Q header prior to execution
-                    if 'vlan_vid' in msg.match:
+                    # to pop the vlan info properly
+                    vlan_header = pkt.get_protocol(vlan_pkt.vlan)
+                    if vlan_header is not None:
                         actions.append(parser.OFPActionPopVlan())
 
             actions.append(parser.OFPActionOutput(out_port))
