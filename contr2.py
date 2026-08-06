@@ -40,7 +40,7 @@ from ryu.lib.packet import ether_types
 from ryu.lib.packet import arp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import udp
-#from ryu.lib.packet import vlan as vlan_pkt
+from ryu.lib.packet import vlan as vlan_pkt
 
 
 # ==========================================================================
@@ -269,15 +269,14 @@ class EnterpriseController(app_manager.RyuApp):
     # Helper: extract VLAN ID (Management sub-classification)
     # ----------------------------------------------------------------
     def get_management_vlan(self, msg):
-        """Return the VLAN ID present on the packet, or None if untagged."""
-        ofproto = msg.datapath.ofproto
-        vlan_vid = msg.match.get('vlan_vid')
-        if vlan_vid is None:
-            return None
-        if vlan_vid& ofproto.OFPVID_PRESNT:
-            return vlan_vid & ~ofproto.OFPVID_PRESENT
-        return None
+        
+            ofproto = msg.datapath.ofproto
+            vlan_vid = msg.match.get('vlan_vid')
 
+            if vlan_vid is None or not (vlan_vid & ofproto.OFPVID_PRESENT):
+                return None
+
+            return vlan_vid & ~ofproto.OFPVID_PRESENT
     # ----------------------------------------------------------------
     # Helper: inter-department policy check
     # ----------------------------------------------------------------
@@ -402,6 +401,8 @@ class EnterpriseController(app_manager.RyuApp):
         src_department = self.get_department(dpid, in_port)
         vlan_id = None
         if src_department == 'MANAGEMENT':
+            #self.logger.info('FULL MATCH FIELDS: %s', dict(msg.match.items()))
+            #self.logger.info('RAW FRAME HEX: %s', msg.data.hex())
             vlan_id = self.get_management_vlan(msg)
             self.logger.info('Management VLAN detected: dpid=%s in_port=%s vlan=%s',
                               dpid, in_port, vlan_id)
@@ -438,6 +439,7 @@ class EnterpriseController(app_manager.RyuApp):
                 )
                 return  # Drop this packet; do not forward it.
 
+       
         # ---- Build forwarding actions (with QoS on aggregation switch) ----
         if dpid == AGGREGATION_DPID and src_department is not None and out_port != ofproto.OFPP_FLOOD:
             queue_id = self.get_queue(src_department, vlan_id, pkt)
@@ -453,7 +455,23 @@ class EnterpriseController(app_manager.RyuApp):
                 in_port, out_port, src, dst,
             )
         else:
-            actions = [parser.OFPActionOutput(out_port)]
+            actions = []
+            if dpid != AGGREGATION_DPID:
+                # 1. Egressing via uplink (port 1) towards the aggregation switch -> Push VLAN
+                if out_port == 1:
+                    # Manually apply VLAN headers specifically for the Management switch (DPID 6)
+                    if dpid == 6:
+                        vid = 50 if in_port in (2, 3) else 60
+                        actions.append(parser.OFPActionPushVlan(ether_types.ETH_TYPE_8021Q))
+                        actions.append(parser.OFPActionSetField(vlan_vid=(vid | ofproto.OFPVID_PRESENT)))
+                
+                # 2. Ingressing from uplink (port 1), egressing to a host port -> Pop VLAN safely
+                elif in_port == 1 and out_port != ofproto.OFPP_FLOOD and out_port != 1:
+                    # Explicitly validate the presence of the 802.1Q header prior to execution
+                    if 'vlan_vid' in msg.match:
+                        actions.append(parser.OFPActionPopVlan())
+
+            actions.append(parser.OFPActionOutput(out_port))
             priority = NON_AGGREGATION_PRIORITY
 
         # ---- Install the flow (avoid re-triggering packet-in for known dst)
@@ -471,6 +489,8 @@ class EnterpriseController(app_manager.RyuApp):
             # independently classified.
             if dpid == AGGREGATION_DPID:
                 match_fields['eth_type'] = eth.ethertype
+                if src_department == 'MANAGEMENT' and vlan_id is not None:
+                    match_fields['vlan_vid'] = vlan_id | ofproto.OFPVID_PRESENT
                 if eth.ethertype == ether_types.ETH_TYPE_IP:
                     ip_header = pkt.get_protocol(ipv4.ipv4)
                     if ip_header is not None:
