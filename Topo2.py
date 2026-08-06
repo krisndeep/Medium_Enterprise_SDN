@@ -43,7 +43,8 @@ from mininet.log import setLogLevel, info
 # Controller connection parameters
 # --------------------------------------------------------------------------
 CONTROLLER_IP = '127.0.0.1'
-CONTROLLER_PORT = 6653
+PRIMARY_CONTROLLER_PORT = 6653
+STANDBY_CONTROLLER_PORT = 6654
 
 # --------------------------------------------------------------------------
 # VLAN configuration (Management department only)
@@ -91,7 +92,13 @@ def build_network():
         'c0',
         controller=RemoteController,
         ip=CONTROLLER_IP,
-        port=CONTROLLER_PORT,
+        port=PRIMARY_CONTROLLER_PORT,
+    )
+    net.addController(
+        'c1',
+        controller=RemoteController,
+        ip=CONTROLLER_IP,
+        port=STANDBY_CONTROLLER_PORT,
     )
 
     info('*** Adding aggregation switch\n')

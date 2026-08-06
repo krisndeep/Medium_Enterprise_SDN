@@ -24,11 +24,15 @@ numbers.
 This file must stay consistent with the DPID/port map, VLAN IDs, queue
 IDs, and OpenFlow priorities defined in topology.py.
 """
+import os
+import socket
+import time
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
+from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
@@ -115,6 +119,8 @@ BLOCKED_PAIRS = {
 # Departments that are allowed to communicate with every other department.
 UNIVERSAL_DEPARTMENTS = {'MANAGEMENT', 'INFRASTRUCTURE', 'SERVERS'}
 
+HEALTH_CHECK_INTERVAL = 2 # liveness check interval in seconds
+FAILS_BEFORE_PROMOTION = 3 # number of consecutive failed health checks before a standby controller takes control
 
 class EnterpriseController(app_manager.RyuApp):
     """OpenFlow 1.3 enterprise learning switch with VLAN/QoS/policy logic."""
@@ -125,6 +131,55 @@ class EnterpriseController(app_manager.RyuApp):
         super(EnterpriseController, self).__init__(*args, **kwargs)
         # mac_to_port[dpid][mac] = port
         self.mac_to_port = {}
+
+        # -- primary/standby controller failover support --
+        self.datapaths = {}
+        role = os.environ.get('RYU_ROLE', 'primary').lower()
+        self.is_primary = (role == 'primary')
+        self.current_role = 'MASTER' if self.is_primary else 'SLAVE'
+
+        self.peer_ip = os.environ.get('RYU_PEER_IP', '127.0.0.1')
+        self.peer_port = int(os.environ.get('RYU_PEER_PORT', '6653'))
+        self.gen_id = int(time.time())  
+
+        self.logger.info('Startting as %s -> initial OpenFlow role %s', role.upper(), self.current_role)
+
+        if not self.is_primary:
+            hub.spawn(self._monitor_primary)
+
+    # ----------------------------------------------------------------
+    # primary/standby controller failover support
+    # ----------------------------------------------------------------
+    def _monitor_primary(self):
+        fails = 0
+        while True:
+            hub.sleep(HEALTH_CHECK_INTERVAL)
+            if self._peer_alive():
+                fails = 0
+                continue
+            fails+=1
+            self.logger.warning('Primary unreachable (%d/%d checks failed)', fails, FAILS_BEFORE_PROMOTION)
+            if fails >= FAILS_BEFORE_PROMOTION and self.current_role != 'MASTER':
+                self.logger.warning('Primary presumed DOWN -> promoting standby to MASTER')
+                self._promote_to_master()
+
+    def _peer_alive(self):
+        try:
+            s=socket.create_connection((self.peer_ip, self.peer_port), timeout=1)
+            s.close()
+            return True
+        except OSError:
+            return False
+
+    def _promote_to_master(self):
+        self.current_role = 'MASTER'
+        self.gen_id = int(time.time())
+        for dp in self.datapaths.values():
+            self._send_role_request(dp, dp.ofproto.OFPCR_ROLE_MASTER)
+
+    def _send_role_request(self, datapath, role):
+        parser = datapath.ofproto_parser
+        datapath.send_msg(parser.OFPRoleRequest(datapath, role, self.gen_id))
 
     # ----------------------------------------------------------------
     # Switch connection / table-miss installation
@@ -137,6 +192,11 @@ class EnterpriseController(app_manager.RyuApp):
 
         self.logger.info('Switch connected: dpid=%s', datapath.id)
 
+        role = ofproto.OFPCR_ROLE_MASTER if self.current_role == 'MASTER' else ofproto.OFPCR_ROLE_SLAVE
+        self._send_role_request(datapath, role)
+
+        self.logger.info('Switch connected: dpid=%s', datapath.id)
+
         # Table-miss flow: send anything not matched by a higher-priority
         # rule up to the controller.
         match = parser.OFPMatch()
@@ -145,6 +205,13 @@ class EnterpriseController(app_manager.RyuApp):
         ]
         self.add_flow(datapath, TABLE_MISS_PRIORITY, match, actions)
         self.logger.info('Installed table-miss flow on dpid=%s', datapath.id)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, DEAD_DISPATCHER)
+    def switch_disconnect_handler(self, ev):
+        dp = ev.datapath
+        if dp and dp.id in self.datapaths:
+            del self.datapaths[dp.id]
+            self.logger.info('Switch disconnected: dpid=%s', dp.id)
 
     # ----------------------------------------------------------------
     # Helper: install a flow entry
@@ -268,6 +335,9 @@ class EnterpriseController(app_manager.RyuApp):
     # ----------------------------------------------------------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        if self.current_role != 'MASTER':
+            return
+        
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
