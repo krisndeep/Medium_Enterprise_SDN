@@ -22,6 +22,7 @@ AGGREGATION_DPID / port-to-department mapping used in the controller):
     Port 5 -> Management switch
     Port 6 -> Infrastructure switch
     Port 7 -> Servers switch
+    Port 8 -> Attacker switch (external / untrusted)
 
 No static IP addresses are assigned anywhere in this topology -- hosts
 receive addresses dynamically (Mininet's default DHCP-less "no fixed IP"
@@ -114,9 +115,10 @@ def build_network():
     s_mgmt = net.addSwitch('s_mgmt', dpid='0000000000000006', protocols='OpenFlow13')
     s_infra = net.addSwitch('s_infra', dpid='0000000000000007', protocols='OpenFlow13')
     s_srv = net.addSwitch('s_srv', dpid='0000000000000008', protocols='OpenFlow13')
+    s_atk = net.addSwitch('s_atk', dpid='0000000000000009', protocols='OpenFlow13')
 
     info('*** Wiring aggregation switch to department switches\n')
-    # Ports on s1 are pinned explicitly (1-7) so the controller's
+    # Ports on s1 are pinned explicitly (1-8) so the controller's
     # DPID/port -> department mapping is guaranteed to hold.
     net.addLink(s1, s_hr, port1=1, port2=1)
     net.addLink(s1, s_dev, port1=2, port2=1)
@@ -125,6 +127,7 @@ def build_network():
     net.addLink(s1, s_mgmt, port1=5, port2=1)
     net.addLink(s1, s_infra, port1=6, port2=1)
     net.addLink(s1, s_srv, port1=7, port2=1)
+    net.addLink(s1, s_atk, port1=8, port2=1)
 
     # ----------------------------------------------------------------
     # HR department
@@ -195,6 +198,13 @@ def build_network():
     net.addLink(s_srv, db_serv, port1=2, port2=0)
     net.addLink(s_srv, web_serv, port1=3, port2=0)
 
+    # ----------------------------------------------------------------
+    # External Attacker (untrusted / outside all departments)
+    # ----------------------------------------------------------------
+    info('*** Adding Attacker host\n')
+    attacker = net.addHost('attacker')
+    net.addLink(s_atk, attacker, port1=2, port2=0)
+
     return net
 
 
@@ -245,7 +255,7 @@ def configure_aggregation_qos(net):
     s1 = net.get('s1')
     aggregation_ports = [
         's1-eth1', 's1-eth2', 's1-eth3', 's1-eth4',
-        's1-eth5', 's1-eth6', 's1-eth7',
+        's1-eth5', 's1-eth6', 's1-eth7', 's1-eth8',
     ]
 
     for intf_name in aggregation_ports:

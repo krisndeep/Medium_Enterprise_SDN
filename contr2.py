@@ -40,7 +40,7 @@ from ryu.lib.packet import ether_types
 from ryu.lib.packet import arp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import udp
-#from ryu.lib.packet import vlan as vlan_pkt
+from ryu.lib.packet import vlan as vlan_pkt
 
 
 # ==========================================================================
@@ -60,6 +60,7 @@ PORT_TO_DEPARTMENT = {
     5: 'MANAGEMENT',
     6: 'INFRASTRUCTURE',
     7: 'SERVERS',
+    8: 'ATTACKER',
 }
 
 # VLAN IDs used exclusively within the Management department.
@@ -108,6 +109,17 @@ BLOCKED_FLOW_PRIORITY = 500     # explicit DROP flows always win
 TABLE_MISS_PRIORITY = 0
 BLOCKED_FLOW_IDLE_TIMEOUT = 30  # seconds
 
+# --------------------------------------------------------------------------
+# Attacker Security Policy constants
+# --------------------------------------------------------------------------
+# Policy 1 – Critical infrastructure departments the attacker MUST NOT reach.
+ATTACKER_CRITICAL_TARGETS = {'INFRASTRUCTURE', 'MANAGEMENT', 'SERVERS'}
+
+# Policy 3 – Dynamic quarantine: after this many violations the attacker
+#             is fully quarantined (all traffic from its MAC is dropped).
+ATTACKER_QUARANTINE_THRESHOLD = 3
+QUARANTINE_FLOW_PRIORITY = 600  # higher than any other rule
+
 # Inter-department communication policy.
 # Departments explicitly forbidden from talking to each other.
 BLOCKED_PAIRS = {
@@ -131,6 +143,12 @@ class EnterpriseController(app_manager.RyuApp):
         super(EnterpriseController, self).__init__(*args, **kwargs)
         # mac_to_port[dpid][mac] = port
         self.mac_to_port = {}
+
+        # -- Attacker dynamic quarantine state --
+        # violation_count[mac_address] = int
+        self.violation_count = {}
+        # quarantined[mac_address] = True when full quarantine is active
+        self.quarantined = {}
 
         # -- primary/standby controller failover support --
         self.datapaths = {}
@@ -187,6 +205,7 @@ class EnterpriseController(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
+        self.datapaths[datapath.id] = datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -250,16 +269,24 @@ class EnterpriseController(app_manager.RyuApp):
     # ----------------------------------------------------------------
     # Helper: extract VLAN ID (Management sub-classification)
     # ----------------------------------------------------------------
-    def get_management_vlan(self, msg):
-        """Return the VLAN ID present on the packet, or None if untagged."""
+    def get_management_vlan(self, dpid, in_port):
+        if dpid !=6:
+            return None
+        if in_port in (2, 3):
+            return 50
+        if in_port in (4, 5):
+            return 60
+        return None
+    
+        ''''
         ofproto = msg.datapath.ofproto
         vlan_vid = msg.match.get('vlan_vid')
-        if vlan_vid is None:
-            return None
-        if vlan_vid& ofproto.OFPVID_PRESNT:
-            return vlan_vid & ~ofproto.OFPVID_PRESENT
-        return None
 
+        if vlan_vid is None or not (vlan_vid & ofproto.OFPVID_PRESENT):
+            return None
+
+        return vlan_vid & ~ofproto.OFPVID_PRESENT
+        '''
     # ----------------------------------------------------------------
     # Helper: inter-department policy check
     # ----------------------------------------------------------------
@@ -269,6 +296,12 @@ class EnterpriseController(app_manager.RyuApp):
         if src_group is None or dst_group is None:
             # Unknown classification (e.g. flooding) - do not block.
             return True
+
+        # --- Attacker Policy 2: Department Isolation ---
+        # The attacker is not a member of any department.  ALL
+        # communication from/to the ATTACKER group is denied.
+        if src_group == 'ATTACKER' or dst_group == 'ATTACKER':
+            return False
 
         if src_group == dst_group:
             return True
@@ -378,7 +411,14 @@ class EnterpriseController(app_manager.RyuApp):
         src_department = self.get_department(dpid, in_port)
         vlan_id = None
         if src_department == 'MANAGEMENT':
-            vlan_id = self.get_management_vlan(msg)
+            #self.logger.info('FULL MATCH FIELDS: %s', dict(msg.match.items()))
+            #self.logger.info('RAW FRAME HEX: %s', msg.data.hex())
+            vlan_header = pkt.get_protocol(vlan_pkt.vlan)
+            if vlan_header is not None:
+                vlan_id = vlan_header.vid
+            else:
+                vlan_id = None
+
             self.logger.info('Management VLAN detected: dpid=%s in_port=%s vlan=%s',
                               dpid, in_port, vlan_id)
 
@@ -395,6 +435,14 @@ class EnterpriseController(app_manager.RyuApp):
         # ---- Policy enforcement (aggregation switch only, both ends known) -
         if dpid == AGGREGATION_DPID and src_department is not None and dst_department is not None:
             if not self.pair_allowed(src_department, dst_department):
+                # --- Attacker-specific enhanced enforcement ---
+                if src_department == 'ATTACKER':
+                    self._handle_attacker_violation(
+                        datapath, parser, in_port, src, dst,
+                        src_department, dst_department,
+                    )
+                    return  # Drop this packet; do not forward it.
+
                 match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
                 self.add_flow(
                     datapath, BLOCKED_FLOW_PRIORITY, match, actions=[],
@@ -406,6 +454,7 @@ class EnterpriseController(app_manager.RyuApp):
                 )
                 return  # Drop this packet; do not forward it.
 
+       
         # ---- Build forwarding actions (with QoS on aggregation switch) ----
         if dpid == AGGREGATION_DPID and src_department is not None and out_port != ofproto.OFPP_FLOOD:
             queue_id = self.get_queue(src_department, vlan_id, pkt)
@@ -421,7 +470,25 @@ class EnterpriseController(app_manager.RyuApp):
                 in_port, out_port, src, dst,
             )
         else:
-            actions = [parser.OFPActionOutput(out_port)]
+            actions = []
+            if dpid != AGGREGATION_DPID:
+                # 1. Egressing via uplink (port 1) towards the aggregation switch -> Push VLAN
+                if out_port == 1:
+                    # Manually apply VLAN headers specifically for the Management switch (DPID 6)
+                    if dpid == 6:
+                        vid = 50 if in_port in (2, 3) else 60
+                        actions.append(parser.OFPActionPushVlan(ether_types.ETH_TYPE_8021Q))
+                        actions.append(parser.OFPActionSetField(vlan_vid=(vid | ofproto.OFPVID_PRESENT)))
+                
+                # 2. Ingressing from uplink (port 1), egressing to a host port -> Pop VLAN safely
+                elif in_port == 1 and out_port != ofproto.OFPP_FLOOD and out_port != 1:
+                    # Explicitly validate the presence of the 802.1Q header prior to execution
+                    # to pop the vlan info properly
+                    vlan_header = pkt.get_protocol(vlan_pkt.vlan)
+                    if vlan_header is not None:
+                        actions.append(parser.OFPActionPopVlan())
+
+            actions.append(parser.OFPActionOutput(out_port))
             priority = NON_AGGREGATION_PRIORITY
 
         # ---- Install the flow (avoid re-triggering packet-in for known dst)
@@ -439,6 +506,8 @@ class EnterpriseController(app_manager.RyuApp):
             # independently classified.
             if dpid == AGGREGATION_DPID:
                 match_fields['eth_type'] = eth.ethertype
+                if src_department == 'MANAGEMENT' and vlan_id is not None:
+                    match_fields['vlan_vid'] = vlan_id | ofproto.OFPVID_PRESENT
                 if eth.ethertype == ether_types.ETH_TYPE_IP:
                     ip_header = pkt.get_protocol(ipv4.ipv4)
                     if ip_header is not None:
@@ -466,3 +535,63 @@ class EnterpriseController(app_manager.RyuApp):
             actions=actions, data=data,
         )
         datapath.send_msg(out)
+
+    # ----------------------------------------------------------------
+    # Attacker Policy Enforcement
+    # ----------------------------------------------------------------
+    def _handle_attacker_violation(self, datapath, parser, in_port,
+                                   src_mac, dst_mac,
+                                   src_department, dst_department):
+        """Handle a policy violation originating from the ATTACKER.
+
+        Policy 1 – Installs a high-priority DROP rule for the specific
+                   src/dst pair when the destination is critical infrastructure.
+        Policy 2 – Installs a DROP for any other blocked pair.
+        Policy 3 – Tracks violations; once the threshold is exceeded,
+                   installs a blanket MAC-based quarantine rule that drops
+                   ALL traffic from the attacker.
+        """
+        # --- Policy 1: Log and block critical-infrastructure access ---
+        if dst_department in ATTACKER_CRITICAL_TARGETS:
+            self.logger.warning(
+                'ATTACKER POLICY-1: Blocked attacker access to critical '
+                'infrastructure: %s -> %s (src=%s dst=%s)',
+                src_department, dst_department, src_mac, dst_mac,
+            )
+        else:
+            self.logger.warning(
+                'ATTACKER POLICY-2: Blocked attacker lateral movement: '
+                '%s -> %s (src=%s dst=%s)',
+                src_department, dst_department, src_mac, dst_mac,
+            )
+
+        # Install a DROP for this specific src->dst pair.
+        match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
+        self.add_flow(
+            datapath, BLOCKED_FLOW_PRIORITY, match, actions=[],
+            idle_timeout=BLOCKED_FLOW_IDLE_TIMEOUT,
+        )
+
+        # --- Policy 3: Dynamic Quarantine ---
+        self.violation_count.setdefault(src_mac, 0)
+        self.violation_count[src_mac] += 1
+        count = self.violation_count[src_mac]
+        self.logger.warning(
+            'ATTACKER POLICY-3: Violation count for %s = %d / %d',
+            src_mac, count, ATTACKER_QUARANTINE_THRESHOLD,
+        )
+
+        if count >= ATTACKER_QUARANTINE_THRESHOLD and not self.quarantined.get(src_mac):
+            self.quarantined[src_mac] = True
+            # Blanket quarantine: drop ALL traffic from the attacker's MAC
+            # regardless of destination, on all ports.
+            quarantine_match = parser.OFPMatch(eth_src=src_mac)
+            self.add_flow(
+                datapath, QUARANTINE_FLOW_PRIORITY, quarantine_match,
+                actions=[],  # DROP
+            )
+            self.logger.critical(
+                'ATTACKER QUARANTINED: MAC %s fully blocked at priority %d '
+                'after %d violations',
+                src_mac, QUARANTINE_FLOW_PRIORITY, count,
+            )
