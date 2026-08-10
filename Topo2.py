@@ -95,12 +95,6 @@ def build_network():
         ip=CONTROLLER_IP,
         port=PRIMARY_CONTROLLER_PORT,
     )
-    net.addController(
-        'c1',
-        controller=RemoteController,
-        ip=CONTROLLER_IP,
-        port=STANDBY_CONTROLLER_PORT,
-    )
 
     info('*** Adding aggregation switch\n')
     # The aggregation switch is DPID 1. All department switches connect

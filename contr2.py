@@ -24,9 +24,6 @@ numbers.
 This file must stay consistent with the DPID/port map, VLAN IDs, queue
 IDs, and OpenFlow priorities defined in topology.py.
 """
-import os
-import socket
-import time
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -151,53 +148,7 @@ class EnterpriseController(app_manager.RyuApp):
         self.quarantined = {}
 
         # -- primary/standby controller failover support --
-        self.datapaths = {}
-        role = os.environ.get('RYU_ROLE', 'primary').lower()
-        self.is_primary = (role == 'primary')
-        self.current_role = 'MASTER' if self.is_primary else 'SLAVE'
-
-        self.peer_ip = os.environ.get('RYU_PEER_IP', '127.0.0.1')
-        self.peer_port = int(os.environ.get('RYU_PEER_PORT', '6653'))
-        self.gen_id = int(time.time())  
-
-        self.logger.info('Startting as %s -> initial OpenFlow role %s', role.upper(), self.current_role)
-
-        if not self.is_primary:
-            hub.spawn(self._monitor_primary)
-
-    # ----------------------------------------------------------------
-    # primary/standby controller failover support
-    # ----------------------------------------------------------------
-    def _monitor_primary(self):
-        fails = 0
-        while True:
-            hub.sleep(HEALTH_CHECK_INTERVAL)
-            if self._peer_alive():
-                fails = 0
-                continue
-            fails+=1
-            self.logger.warning('Primary unreachable (%d/%d checks failed)', fails, FAILS_BEFORE_PROMOTION)
-            if fails >= FAILS_BEFORE_PROMOTION and self.current_role != 'MASTER':
-                self.logger.warning('Primary presumed DOWN -> promoting standby to MASTER')
-                self._promote_to_master()
-
-    def _peer_alive(self):
-        try:
-            s=socket.create_connection((self.peer_ip, self.peer_port), timeout=1)
-            s.close()
-            return True
-        except OSError:
-            return False
-
-    def _promote_to_master(self):
-        self.current_role = 'MASTER'
-        self.gen_id = int(time.time())
-        for dp in self.datapaths.values():
-            self._send_role_request(dp, dp.ofproto.OFPCR_ROLE_MASTER)
-
-    def _send_role_request(self, datapath, role):
-        parser = datapath.ofproto_parser
-        datapath.send_msg(parser.OFPRoleRequest(datapath, role, self.gen_id))
+        self.datapaths = {} 
 
     # ----------------------------------------------------------------
     # Switch connection / table-miss installation
@@ -208,11 +159,6 @@ class EnterpriseController(app_manager.RyuApp):
         self.datapaths[datapath.id] = datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        self.logger.info('Switch connected: dpid=%s', datapath.id)
-
-        role = ofproto.OFPCR_ROLE_MASTER if self.current_role == 'MASTER' else ofproto.OFPCR_ROLE_SLAVE
-        self._send_role_request(datapath, role)
 
         self.logger.info('Switch connected: dpid=%s', datapath.id)
 
@@ -368,9 +314,6 @@ class EnterpriseController(app_manager.RyuApp):
     # ----------------------------------------------------------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        if self.current_role != 'MASTER':
-            return
-        
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
