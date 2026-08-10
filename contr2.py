@@ -64,6 +64,25 @@ PORT_TO_DEPARTMENT = {
 VLAN_UPPER_MGMT = 50
 VLAN_LOWER_MGMT = 60
 
+# --------------------------------------------------------------------------
+# Sub-department identification (MUST match topology.py)
+#
+# The aggregation switch only classifies traffic down to department
+# granularity (PORT_TO_DEPARTMENT above). Some policy rules below need
+# finer granularity than that:
+#   - Upper Management vs. Lower Management (distinguished by VLAN,
+#     learned from the Management switch).
+#   - The single "exec" host in Call Support who gets Upper Management
+#     access that ordinary Call Support agents do not (learned from the
+#     Call Support switch).
+# --------------------------------------------------------------------------
+MGMT_SWITCH_DPID = 6
+MGMT_UPPER_PORTS = (2, 3)   # s_mgmt ports -> ceo, director
+MGMT_LOWER_PORTS = (4, 5)   # s_mgmt ports -> manager1, manager2
+
+CALL_SUPPORT_DPID = 5
+CALL_SUPPORT_EXEC_PORT = 2  # s_call port -> exec1
+
 # VoIP protocol ports (Upper Management only).
 SIP_PORT = 5060
 RTP_PORT_MIN = 16384
@@ -128,6 +147,33 @@ BLOCKED_PAIRS = {
 # Departments that are allowed to communicate with every other department.
 UNIVERSAL_DEPARTMENTS = {'MANAGEMENT', 'INFRASTRUCTURE', 'SERVERS'}
 
+# --------------------------------------------------------------------------
+# Upper Management restricted-access policy
+#
+# Upper Management (VLAN 50: ceo, director) is NOT universally reachable
+# like the rest of the Management department. Only the groups listed
+# here may exchange traffic with Upper Management:
+#   - HR
+#   - Lower Management (VLAN 60)
+#   - Business
+#   - The designated Call Support executive (exec1) -- NOT ordinary
+#     Call Support agents (support1, support2)
+#   - Infrastructure / Servers / unclassified Management, which retain
+#     their normal universal-department access
+#
+# Software Development (SDE) and ordinary Call Support are explicitly
+# excluded, i.e. denied access to Upper Management.
+# --------------------------------------------------------------------------
+ALLOWED_TO_UPPER_MGMT = {
+    'HR',
+    'LOWER_MGMT',
+    'BUSINESS',
+    'CALL_SUPPORT_EXEC',
+    'MANAGEMENT',        # unclassified / VLAN-unknown Management traffic
+    'INFRASTRUCTURE',
+    'SERVERS',
+}
+
 HEALTH_CHECK_INTERVAL = 2 # liveness check interval in seconds
 FAILS_BEFORE_PROMOTION = 3 # number of consecutive failed health checks before a standby controller takes control
 
@@ -148,7 +194,15 @@ class EnterpriseController(app_manager.RyuApp):
         self.quarantined = {}
 
         # -- primary/standby controller failover support --
-        self.datapaths = {} 
+        self.datapaths = {}
+
+        # -- Upper/Lower Management + Call Support exec identification --
+        # mac_vlan[mac] = 50 or 60, learned at the Management switch from
+        # which host port (2/3 = Upper, 4/5 = Lower) a MAC was first seen.
+        self.mac_vlan = {}
+        # privileged_macs[mac] = True for exec1's MAC, learned at the
+        # Call Support switch's port 2.
+        self.privileged_macs = {}
 
     # ----------------------------------------------------------------
     # Switch connection / table-miss installation
@@ -216,12 +270,12 @@ class EnterpriseController(app_manager.RyuApp):
     # Helper: extract VLAN ID (Management sub-classification)
     # ----------------------------------------------------------------
     def get_management_vlan(self, dpid, in_port):
-        if dpid !=6:
+        if dpid != MGMT_SWITCH_DPID:
             return None
-        if in_port in (2, 3):
-            return 50
-        if in_port in (4, 5):
-            return 60
+        if in_port in MGMT_UPPER_PORTS:
+            return VLAN_UPPER_MGMT
+        if in_port in MGMT_LOWER_PORTS:
+            return VLAN_LOWER_MGMT
         return None
     
         ''''
@@ -234,11 +288,55 @@ class EnterpriseController(app_manager.RyuApp):
         return vlan_vid & ~ofproto.OFPVID_PRESENT
         '''
     # ----------------------------------------------------------------
+    # Helper: sub-department classification (Upper/Lower Mgmt, exec)
+    # ----------------------------------------------------------------
+    def classify_group(self, department, mac, vlan_id=None):
+        """Refine a coarse department into the finer-grained policy group
+        used by pair_allowed(), using learned per-MAC context where the
+        raw (dpid, port) classification alone isn't enough.
+
+        department -- value from get_department() / PORT_TO_DEPARTMENT.
+        mac        -- the host's MAC address (src or dst).
+        vlan_id    -- the VLAN ID actually seen on the packet, if this is
+                      the source and it was just parsed from an 802.1Q
+                      header (more authoritative than the learned cache).
+        """
+        if department == 'MANAGEMENT':
+            effective_vlan = vlan_id if vlan_id is not None else self.mac_vlan.get(mac)
+            if effective_vlan == VLAN_UPPER_MGMT:
+                return 'UPPER_MGMT'
+            if effective_vlan == VLAN_LOWER_MGMT:
+                return 'LOWER_MGMT'
+            return 'MANAGEMENT'
+
+        if department == 'CALL_SUPPORT':
+            if self.privileged_macs.get(mac):
+                return 'CALL_SUPPORT_EXEC'
+            return 'CALL_SUPPORT'
+
+        return department
+
+    def _normalize_group(self, group):
+        """Collapse a fine-grained sub-group back to its parent department
+        for policy checks that don't care about the Upper/Lower Management
+        or Call-Support-exec distinction."""
+        if group in ('UPPER_MGMT', 'LOWER_MGMT'):
+            return 'MANAGEMENT'
+        if group == 'CALL_SUPPORT_EXEC':
+            return 'CALL_SUPPORT'
+        return group
+
+    # ----------------------------------------------------------------
     # Helper: inter-department policy check
     # ----------------------------------------------------------------
     def pair_allowed(self, src_group, dst_group):
         """Return True if src_group is permitted to communicate with
-        dst_group, per the enterprise communication policy."""
+        dst_group, per the enterprise communication policy.
+
+        src_group / dst_group are the fine-grained groups returned by
+        classify_group() -- e.g. 'UPPER_MGMT', 'LOWER_MGMT',
+        'CALL_SUPPORT_EXEC' -- not just the raw department name.
+        """
         if src_group is None or dst_group is None:
             # Unknown classification (e.g. flooding) - do not block.
             return True
@@ -252,10 +350,23 @@ class EnterpriseController(app_manager.RyuApp):
         if src_group == dst_group:
             return True
 
-        if src_group in UNIVERSAL_DEPARTMENTS or dst_group in UNIVERSAL_DEPARTMENTS:
+        # --- Upper Management restricted-access policy ---
+        # Only HR, Lower Management, Business, and exec1 (the privileged
+        # Call Support exec) may talk to Upper Management. Everyone else
+        # -- notably SDE and ordinary Call Support agents -- is denied,
+        # overriding the "universal department" allowance below.
+        if src_group == 'UPPER_MGMT' or dst_group == 'UPPER_MGMT':
+            other = dst_group if src_group == 'UPPER_MGMT' else src_group
+            return other in ALLOWED_TO_UPPER_MGMT
+
+        # Remaining checks operate at parent-department granularity.
+        src_norm = self._normalize_group(src_group)
+        dst_norm = self._normalize_group(dst_group)
+
+        if src_norm in UNIVERSAL_DEPARTMENTS or dst_norm in UNIVERSAL_DEPARTMENTS:
             return True
 
-        if frozenset({src_group, dst_group}) in BLOCKED_PAIRS:
+        if frozenset({src_norm, dst_norm}) in BLOCKED_PAIRS:
             return False
 
         return True
@@ -338,6 +449,17 @@ class EnterpriseController(app_manager.RyuApp):
             self.logger.info('MAC learned: dpid=%s mac=%s port=%s', dpid, src, in_port)
         self.mac_to_port[dpid][src] = in_port
 
+        # ---- Learn sub-department context (Upper/Lower Mgmt, exec) -------
+        if dpid == MGMT_SWITCH_DPID and in_port in MGMT_UPPER_PORTS:
+            self.mac_vlan[src] = VLAN_UPPER_MGMT
+        elif dpid == MGMT_SWITCH_DPID and in_port in MGMT_LOWER_PORTS:
+            self.mac_vlan[src] = VLAN_LOWER_MGMT
+
+        if dpid == CALL_SUPPORT_DPID and in_port == CALL_SUPPORT_EXEC_PORT:
+            if not self.privileged_macs.get(src):
+                self.logger.info('Call Support exec identified: mac=%s', src)
+            self.privileged_macs[src] = True
+
         # ---- Protocol-aware logging (ARP / IPv4) --------------------------
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_header = pkt.get_protocol(arp.arp)
@@ -375,9 +497,20 @@ class EnterpriseController(app_manager.RyuApp):
         if dpid == AGGREGATION_DPID and out_port != ofproto.OFPP_FLOOD:
             dst_department = self.get_department(dpid, out_port)
 
+        # ---- Refine to fine-grained policy groups (Upper/Lower Mgmt,
+        #      Call Support exec) for policy enforcement purposes only.
+        #      Queue/priority selection below still uses src_department.
+        src_group = None
+        dst_group = None
+        if dpid == AGGREGATION_DPID:
+            if src_department is not None:
+                src_group = self.classify_group(src_department, src, vlan_id)
+            if dst_department is not None:
+                dst_group = self.classify_group(dst_department, dst)
+
         # ---- Policy enforcement (aggregation switch only, both ends known) -
-        if dpid == AGGREGATION_DPID and src_department is not None and dst_department is not None:
-            if not self.pair_allowed(src_department, dst_department):
+        if dpid == AGGREGATION_DPID and src_group is not None and dst_group is not None:
+            if not self.pair_allowed(src_group, dst_group):
                 # --- Attacker-specific enhanced enforcement ---
                 if src_department == 'ATTACKER':
                     self._handle_attacker_violation(
@@ -393,7 +526,7 @@ class EnterpriseController(app_manager.RyuApp):
                 )
                 self.logger.warning(
                     'BLOCKED communication: %s -> %s (dpid=%s in_port=%s src=%s dst=%s)',
-                    src_department, dst_department, dpid, in_port, src, dst,
+                    src_group, dst_group, dpid, in_port, src, dst,
                 )
                 return  # Drop this packet; do not forward it.
 
