@@ -303,6 +303,12 @@ def main():
     # OpenFlow flow rules: VLAN tagging and HTB queue provisioning.
     configure_management_vlans(net)
     configure_aggregation_qos(net)
+    
+    info('\n*** Running pingAll before dropping into CLI\n')
+    net.pingAll()
+
+    from QoSRes import run_qos_evaluation
+    run_qos_evaluation(net)
 
     info('*** Enterprise SDN topology is up. Dropping into Mininet CLI.\n')
     CLI(net)

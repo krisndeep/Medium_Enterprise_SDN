@@ -128,6 +128,13 @@ BLOCKED_FLOW_IDLE_TIMEOUT = 30  # seconds
 # --------------------------------------------------------------------------
 # Attacker Security Policy constants
 # --------------------------------------------------------------------------
+# Policy 0 – Any traffic arriving on the aggregation switch via a port
+#            that is NOT a registered department uplink (i.e. not a key
+#            in PORT_TO_DEPARTMENT) is dropped outright. This covers
+#            rogue devices plugged into unused/unregistered ports.
+#            Enforced directly in packet_in_handler(), before
+#            classification.
+#
 # Policy 1 – Critical infrastructure departments the attacker MUST NOT reach.
 ATTACKER_CRITICAL_TARGETS = {'INFRASTRUCTURE', 'MANAGEMENT', 'SERVERS'}
 
@@ -154,19 +161,46 @@ UNIVERSAL_DEPARTMENTS = {'MANAGEMENT', 'INFRASTRUCTURE', 'SERVERS'}
 # like the rest of the Management department. Only the groups listed
 # here may exchange traffic with Upper Management:
 #   - HR
-#   - Lower Management (VLAN 60)
 #   - Business
+#   - Lower Management (VLAN 60)
 #   - The designated Call Support executive (exec1) -- NOT ordinary
 #     Call Support agents (support1, support2)
 #   - Infrastructure / Servers / unclassified Management, which retain
 #     their normal universal-department access
 #
 # Software Development (SDE) and ordinary Call Support are explicitly
-# excluded, i.e. denied access to Upper Management.
+# excluded, i.e. denied direct access to Upper Management. SDE may
+# only reach Lower Management (see ALLOWED_TO_LOWER_MGMT below).
 # --------------------------------------------------------------------------
 ALLOWED_TO_UPPER_MGMT = {
     'HR',
+    'BUSINESS',
     'LOWER_MGMT',
+    #'CALL_SUPPORT_EXEC',
+    'MANAGEMENT',        # unclassified / VLAN-unknown Management traffic
+    'INFRASTRUCTURE',
+    'SERVERS',
+}
+
+# --------------------------------------------------------------------------
+# Lower Management restricted-access policy
+#
+# Lower Management (VLAN 60: manager1, manager2) is reachable by most
+# departments, but Call Support is restricted to its executive only:
+#   - The designated Call Support executive (exec1) may reach Lower
+#     Management.
+#   - Ordinary Call Support agents (support1, support2) may NOT --
+#     exec1 is the only Call Support member with any Management access
+#     at all (Upper or Lower).
+#   - HR, Infrastructure, Servers, unclassified Management, Upper
+#     Management, SDE, and Business all retain access to Lower
+#     Management (Business and HR also have Upper Management access;
+#     SDE is limited to Lower Management only).
+# --------------------------------------------------------------------------
+ALLOWED_TO_LOWER_MGMT = {
+    'HR',
+    'UPPER_MGMT',
+    'SDE',
     'BUSINESS',
     'CALL_SUPPORT_EXEC',
     'MANAGEMENT',        # unclassified / VLAN-unknown Management traffic
@@ -351,13 +385,20 @@ class EnterpriseController(app_manager.RyuApp):
             return True
 
         # --- Upper Management restricted-access policy ---
-        # Only HR, Lower Management, Business, and exec1 (the privileged
-        # Call Support exec) may talk to Upper Management. Everyone else
+        # Only HR, Business, Lower Management may talk to Upper Management. Everyone else
         # -- notably SDE and ordinary Call Support agents -- is denied,
         # overriding the "universal department" allowance below.
         if src_group == 'UPPER_MGMT' or dst_group == 'UPPER_MGMT':
             other = dst_group if src_group == 'UPPER_MGMT' else src_group
             return other in ALLOWED_TO_UPPER_MGMT
+
+        # --- Lower Management restricted-access policy ---
+        # Everyone except ordinary Call Support agents may reach Lower
+        # Management (exec1 is the sole Call Support member allowed in,
+        # via CALL_SUPPORT_EXEC in ALLOWED_TO_LOWER_MGMT).
+        if src_group == 'LOWER_MGMT' or dst_group == 'LOWER_MGMT':
+            other = dst_group if src_group == 'LOWER_MGMT' else src_group
+            return other in ALLOWED_TO_LOWER_MGMT
 
         # Remaining checks operate at parent-department granularity.
         src_norm = self._normalize_group(src_group)
@@ -474,6 +515,26 @@ class EnterpriseController(app_manager.RyuApp):
 
         # ---- Department / VLAN classification (aggregation switch only) --
         src_department = self.get_department(dpid, in_port)
+
+        # ---- Attacker Policy 0: Unregistered ingress port -----------------
+        # Any traffic entering the aggregation switch on a port that is
+        # not a recognised department uplink (i.e. not in
+        # PORT_TO_DEPARTMENT) is treated as rogue/unauthorised and is
+        # dropped immediately -- before department/VLAN classification,
+        # policy pairing, or QoS ever run on it.
+        if dpid == AGGREGATION_DPID and src_department is None:
+            match = parser.OFPMatch(in_port=in_port)
+            self.add_flow(
+                datapath, BLOCKED_FLOW_PRIORITY, match, actions=[],
+                idle_timeout=BLOCKED_FLOW_IDLE_TIMEOUT,
+            )
+            self.logger.warning(
+                'ATTACKER POLICY-0: Blocked traffic from unregistered '
+                'ingress port %s on aggregation switch (dpid=%s src=%s dst=%s)',
+                in_port, dpid, src, dst,
+            )
+            return  # Drop this packet; do not forward it.
+
         vlan_id = None
         if src_department == 'MANAGEMENT':
             #self.logger.info('FULL MATCH FIELDS: %s', dict(msg.match.items()))
