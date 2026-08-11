@@ -32,6 +32,7 @@ OFFERED_RATE = 100
 # 5 = Call Support
 # 6 = Infrastructure
 # 7 = Upper Management VoIP
+# 8 = Servers
 
 TESTS = [
     {
@@ -96,7 +97,18 @@ TESTS = [
         "host": "ceo",
         "port": 20000,
         "type": "voip"
+    },
+    {
+        # db_serv is in the SERVERS department, same as web_serv (the
+        # destination for all other test flows). This is the only test
+        # flow that actually exercises QUEUE_SERVERS end to end.
+        "queue": 8,
+        "name": "Servers",
+        "host": "db_serv",
+        "port": 5007,
+        "type": "normal"
     }
+
 ]
 
 
@@ -112,7 +124,8 @@ MINIMUM_RATES = {
     4: 10,
     5: 12,
     6: 15,
-    7: 20
+    7: 20,
+    8: 5
 }
 
 

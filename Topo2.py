@@ -68,13 +68,15 @@ LINK_MAX_RATE = 100_000_000  # 100 Mbps
 QUEUE_CONFIG = {
     7: (20_000_000, 100_000_000, 0),   # Upper Management VoIP  - highest
     6: (15_000_000, 100_000_000, 1),   # Infrastructure
-    5: (12_000_000, 100_000_000, 2),   # Call Support
-    4: (10_000_000, 100_000_000, 3),   # Software Development
-    3: (10_000_000, 100_000_000, 4),   # Business
-    2: (10_000_000, 100_000_000, 5),   # Upper Management (non-VoIP)
-    1: (8_000_000,  100_000_000, 6),   # Lower Management
-    0: (5_000_000,  100_000_000, 7),   # HR - lowest
+    8: (5_000_000,  100_000_000, 2),   # Servers
+    5: (12_000_000, 100_000_000, 3),   # Call Support
+    4: (10_000_000, 100_000_000, 4),   # Software Development
+    3: (10_000_000, 100_000_000, 5),   # Business
+    2: (10_000_000, 100_000_000, 6),   # Upper Management (non-VoIP)
+    1: (8_000_000,  100_000_000, 7),   # Lower Management
+    0: (5_000_000,  100_000_000, 8),   # HR - lowest
 }
+
 
 
 def build_network():
